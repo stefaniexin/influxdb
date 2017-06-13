@@ -39,6 +39,7 @@
 - [#8886](https://github.com/influxdata/influxdb/pull/8886): Improved compaction scheduling
 - [#8690](https://github.com/influxdata/influxdb/issues/8690): Implicitly decide on a lower limit for fill queries when none is present.
 - [#8947](https://github.com/influxdata/influxdb/pull/8947): Add `EXPLAIN ANALYZE` command, which produces a detailed execution plan of a `SELECT` statement.
+- [#8491](https://github.com/influxdata/influxdb/pull/8491): Add further tsi support for streaming/copying shards.
 
 ### Bugfixes
 
@@ -149,7 +150,7 @@ The following new configuration options are available.
 * `max-body-size` was added with a default of 25,000,000, but can be disabled by setting it to 0.
   Specifies the maximum size (in bytes) of a client request body. When a client sends data that exceeds
   the configured maximum size, a `413 Request Entity Too Large` HTTP response is returned.
-  
+
 #### `[continuous_queries]` Section
 
 * `query-stats-enabled` was added with a default of `false`. When set to `true`, continuous query execution statistics are written to the default monitor store.
