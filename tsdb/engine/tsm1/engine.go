@@ -105,7 +105,8 @@ const (
 
 // Engine represents a storage engine with compressed blocks.
 type Engine struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
+	_index tsdb.Index
 
 	// The following group of fields is used to track the state of level compactions within the
 	// Engine. The WaitGroup is used to monitor the compaction goroutines, the 'done' channel is
@@ -125,7 +126,6 @@ type Engine struct {
 	traceLogger  zap.Logger // Logger to be used when trace-logging is on.
 	traceLogging bool
 
-	index    tsdb.Index
 	fieldset *tsdb.MeasurementFieldSet
 
 	WAL            *WAL
@@ -175,7 +175,7 @@ func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string,
 		id:           id,
 		database:     database,
 		path:         path,
-		index:        idx,
+		_index:       idx,
 		logger:       logger,
 		traceLogger:  logger,
 		traceLogging: opt.Config.TraceLoggingEnabled,
@@ -198,7 +198,7 @@ func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string,
 	}
 
 	// Attach fieldset to index.
-	e.index.SetFieldSet(e.fieldset)
+	e._index.SetFieldSet(e.fieldset) // Index can be accessed outside of lock.
 
 	if e.traceLogging {
 		fs.enableTraceLogging(true)
@@ -325,19 +325,19 @@ func (e *Engine) disableSnapshotCompactions() {
 func (e *Engine) Path() string { return e.path }
 
 func (e *Engine) SetFieldName(measurement []byte, name string) {
-	e.index.SetFieldName(measurement, name)
+	e.index().SetFieldName(measurement, name)
 }
 
 func (e *Engine) MeasurementExists(name []byte) (bool, error) {
-	return e.index.MeasurementExists(name)
+	return e.index().MeasurementExists(name)
 }
 
 func (e *Engine) MeasurementNamesByExpr(expr influxql.Expr) ([][]byte, error) {
-	return e.index.MeasurementNamesByExpr(expr)
+	return e.index().MeasurementNamesByExpr(expr)
 }
 
 func (e *Engine) MeasurementNamesByRegex(re *regexp.Regexp) ([][]byte, error) {
-	return e.index.MeasurementNamesByRegex(re)
+	return e.index().MeasurementNamesByRegex(re)
 }
 
 // MeasurementFields returns the measurement fields for a measurement.
@@ -346,11 +346,11 @@ func (e *Engine) MeasurementFields(measurement []byte) *tsdb.MeasurementFields {
 }
 
 func (e *Engine) HasTagKey(name, key []byte) (bool, error) {
-	return e.index.HasTagKey(name, key)
+	return e.index().HasTagKey(name, key)
 }
 
 func (e *Engine) MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[string]struct{}, error) {
-	return e.index.MeasurementTagKeysByExpr(name, expr)
+	return e.index().MeasurementTagKeysByExpr(name, expr)
 }
 
 // MeasurementTagKeyValuesByExpr returns a set of tag values filtered by an expression.
@@ -363,28 +363,28 @@ func (e *Engine) MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[
 // slice.
 //
 func (e *Engine) MeasurementTagKeyValuesByExpr(auth query.Authorizer, name []byte, keys []string, expr influxql.Expr, keysSorted bool) ([][]string, error) {
-	return e.index.MeasurementTagKeyValuesByExpr(auth, name, keys, expr, keysSorted)
+	return e.index().MeasurementTagKeyValuesByExpr(auth, name, keys, expr, keysSorted)
 }
 
 func (e *Engine) ForEachMeasurementTagKey(name []byte, fn func(key []byte) error) error {
-	return e.index.ForEachMeasurementTagKey(name, fn)
+	return e.index().ForEachMeasurementTagKey(name, fn)
 }
 
 func (e *Engine) TagKeyCardinality(name, key []byte) int {
-	return e.index.TagKeyCardinality(name, key)
+	return e.index().TagKeyCardinality(name, key)
 }
 
 // SeriesN returns the unique number of series in the index.
 func (e *Engine) SeriesN() int64 {
-	return e.index.SeriesN()
+	return e.index().SeriesN()
 }
 
 func (e *Engine) SeriesSketches() (estimator.Sketch, estimator.Sketch, error) {
-	return e.index.SeriesSketches()
+	return e.index().SeriesSketches()
 }
 
 func (e *Engine) MeasurementsSketches() (estimator.Sketch, estimator.Sketch, error) {
-	return e.index.MeasurementsSketches()
+	return e.index().MeasurementsSketches()
 }
 
 // LastModified returns the time when this shard was last modified.
@@ -477,7 +477,7 @@ func (e *Engine) Statistics(tags map[string]string) []models.Statistic {
 
 // DiskSize returns the total size in bytes of all TSM and WAL segments on disk.
 func (e *Engine) DiskSize() int64 {
-	return e.FileStore.DiskSizeBytes() + e.WAL.DiskSizeBytes() + e.index.DiskSizeBytes()
+	return e.FileStore.DiskSizeBytes() + e.WAL.DiskSizeBytes() + e.index().DiskSizeBytes()
 }
 
 // Open opens and initializes the engine.
@@ -526,6 +526,12 @@ func (e *Engine) Close() error {
 	return e.WAL.Close()
 }
 
+func (e *Engine) index() tsdb.Index {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e._index
+}
+
 // WithLogger sets the logger for the engine.
 func (e *Engine) WithLogger(log zap.Logger) {
 	e.logger = log.With(zap.String("engine", "tsm1"))
@@ -543,7 +549,9 @@ func (e *Engine) LoadMetadataIndex(shardID uint64, index tsdb.Index) error {
 	now := time.Now()
 
 	// Save reference to index for iterator creation.
-	e.index = index
+	e.mu.Lock()
+	e._index = index
+	e.mu.Unlock()
 
 	if err := e.FileStore.WalkKeys(func(key []byte, typ byte) error {
 		fieldType, err := tsmFieldTypeToInfluxQLDataType(typ)
@@ -717,8 +725,7 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 			return nil, err
 		}
 
-		// The filestore will only handle tsm files. Other file types will be
-		// ignored.
+		// The filestore will only handle tsm files. Other file types will be ignored.
 		if err := e.FileStore.Replace(nil, newFiles); err != nil {
 			return nil, err
 		}
@@ -729,10 +736,10 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 		return err
 	}
 
-	if idx, ok := e.index.(*tsi1.Index); ok {
+	if idx, ok := e.index().(*tsi1.Index); ok {
 		// Initialise new index.
 		e.mu.Lock()
-		if e.index, err = idx.ReplaceIndex(newFiles); err != nil {
+		if e._index, err = idx.ReplaceIndex(newFiles); err != nil {
 			e.mu.Unlock()
 			return err
 		}
@@ -847,9 +854,9 @@ func (e *Engine) addToIndexFromKey(key []byte, fieldType influxql.DataType) erro
 	}
 
 	// Build in-memory index, if necessary.
-	if e.index.Type() == inmem.IndexName {
+	if e.index().Type() == inmem.IndexName {
 		tags, _ := models.ParseTags(seriesKey)
-		if err := e.index.InitializeSeries(seriesKey, name, tags); err != nil {
+		if err := e.index().InitializeSeries(seriesKey, name, tags); err != nil {
 			return err
 		}
 	}
@@ -1036,12 +1043,12 @@ func (e *Engine) DeleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 
 	for k, exists := range existing {
 		if !exists {
-			if err := e.index.UnassignShard(k, e.id); err != nil {
+			if err := e.index().UnassignShard(k, e.id); err != nil {
 				return err
 			}
 		}
 	}
-	go e.index.Rebuild()
+	go e.index().Rebuild()
 
 	return nil
 }
@@ -1091,7 +1098,7 @@ func (e *Engine) DeleteMeasurement(name []byte) error {
 // DeleteMeasurement deletes a measurement and all related series.
 func (e *Engine) deleteMeasurement(name []byte) error {
 	// Attempt to find the series keys.
-	keys, err := e.index.MeasurementSeriesKeysByExpr(name, nil)
+	keys, err := e.index().MeasurementSeriesKeysByExpr(name, nil)
 	if err != nil {
 		return err
 	} else if len(keys) > 0 {
@@ -1104,20 +1111,20 @@ func (e *Engine) deleteMeasurement(name []byte) error {
 
 // ForEachMeasurementName iterates over each measurement name in the engine.
 func (e *Engine) ForEachMeasurementName(fn func(name []byte) error) error {
-	return e.index.ForEachMeasurementName(fn)
+	return e.index().ForEachMeasurementName(fn)
 }
 
 // MeasurementSeriesKeysByExpr returns a list of series keys matching expr.
 func (e *Engine) MeasurementSeriesKeysByExpr(name []byte, expr influxql.Expr) ([][]byte, error) {
-	return e.index.MeasurementSeriesKeysByExpr(name, expr)
+	return e.index().MeasurementSeriesKeysByExpr(name, expr)
 }
 
 func (e *Engine) CreateSeriesListIfNotExists(keys, names [][]byte, tagsSlice []models.Tags) error {
-	return e.index.CreateSeriesListIfNotExists(keys, names, tagsSlice)
+	return e.index().CreateSeriesListIfNotExists(keys, names, tagsSlice)
 }
 
 func (e *Engine) CreateSeriesIfNotExists(key, name []byte, tags models.Tags) error {
-	return e.index.CreateSeriesIfNotExists(key, name, tags)
+	return e.index().CreateSeriesIfNotExists(key, name, tags)
 }
 
 // WriteTo is not implemented.
@@ -1195,7 +1202,7 @@ func (e *Engine) CreateSnapshot() (string, error) {
 	}
 
 	// Generate a snapshot of the index.
-	return path, e.index.SnapshotTo(path)
+	return path, e._index.SnapshotTo(path) // index already under RLock.
 }
 
 // writeSnapshotAndCommit will write the passed cache to a new TSM file and remove the closed WAL segments.
@@ -1444,7 +1451,7 @@ func (e *Engine) compactFull(grp CompactionGroup) bool {
 // onFileStoreReplace is callback handler invoked when the FileStore
 // has replaced one set of TSM files with a new set.
 func (e *Engine) onFileStoreReplace(newFiles []TSMFile) {
-	if e.index.Type() == tsi1.IndexName {
+	if e.index().Type() == tsi1.IndexName {
 		return
 	}
 
@@ -1755,14 +1762,14 @@ func (e *Engine) CreateIterator(ctx context.Context, measurement string, opt que
 func (e *Engine) createCallIterator(ctx context.Context, measurement string, call *influxql.Call, opt query.IteratorOptions) ([]query.Iterator, error) {
 	ref, _ := call.Args[0].(*influxql.VarRef)
 
-	if exists, err := e.index.MeasurementExists([]byte(measurement)); err != nil {
+	if exists, err := e.index().MeasurementExists([]byte(measurement)); err != nil {
 		return nil, err
 	} else if !exists {
 		return nil, nil
 	}
 
 	// Determine tagsets for this measurement based on dimensions and filters.
-	tagSets, err := e.index.TagSets([]byte(measurement), opt)
+	tagSets, err := e.index().TagSets([]byte(measurement), opt)
 	if err != nil {
 		return nil, err
 	}
@@ -1825,14 +1832,14 @@ func (e *Engine) createCallIterator(ctx context.Context, measurement string, cal
 func (e *Engine) createVarRefIterator(ctx context.Context, measurement string, opt query.IteratorOptions) ([]query.Iterator, error) {
 	ref, _ := opt.Expr.(*influxql.VarRef)
 
-	if exists, err := e.index.MeasurementExists([]byte(measurement)); err != nil {
+	if exists, err := e.index().MeasurementExists([]byte(measurement)); err != nil {
 		return nil, err
 	} else if !exists {
 		return nil, nil
 	}
 
 	// Determine tagsets for this measurement based on dimensions and filters.
-	tagSets, err := e.index.TagSets([]byte(measurement), opt)
+	tagSets, err := e.index().TagSets([]byte(measurement), opt)
 	if err != nil {
 		return nil, err
 	}
@@ -2327,14 +2334,14 @@ func (e *Engine) buildBooleanCursor(ctx context.Context, measurement, seriesKey,
 func (e *Engine) IteratorCost(measurement string, opt query.IteratorOptions) (query.IteratorCost, error) {
 	// Determine if this measurement exists. If it does not, then no shards are
 	// accessed to begin with.
-	if exists, err := e.index.MeasurementExists([]byte(measurement)); err != nil {
+	if exists, err := e.index().MeasurementExists([]byte(measurement)); err != nil {
 		return query.IteratorCost{}, err
 	} else if !exists {
 		return query.IteratorCost{}, nil
 	}
 
 	// Determine all of the tag sets for this query.
-	tagSets, err := e.index.TagSets([]byte(measurement), opt)
+	tagSets, err := e.index().TagSets([]byte(measurement), opt)
 	if err != nil {
 		return query.IteratorCost{}, err
 	}
@@ -2397,7 +2404,7 @@ func (e *Engine) seriesCost(seriesKey, field string, tmin, tmax int64) query.Ite
 }
 
 func (e *Engine) SeriesPointIterator(opt query.IteratorOptions) (query.Iterator, error) {
-	return e.index.SeriesPointIterator(opt)
+	return e.index().SeriesPointIterator(opt)
 }
 
 // SeriesFieldKey combine a series key and field name for a unique string to be hashed to a numeric ID.
