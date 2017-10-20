@@ -1383,6 +1383,7 @@ func (m *Manifest) Write() error {
 	}
 	buf = append(buf, '\n')
 	m.size = int64(len(buf))
+	fmt.Println("size manifest is ", m.size)
 	return ioutil.WriteFile(m.path, buf, 0666)
 }
 
