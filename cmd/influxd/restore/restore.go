@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"encoding/json"
-	"github.com/influxdata/influxdb/cmd/influxd/backup"
 	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/services/snapshotter"

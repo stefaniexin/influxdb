@@ -15,9 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"archive/tar"
+	"compress/gzip"
 	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/tcp"
+	"io/ioutil"
 )
 
 // Command represents the program execution for "influxd backup".
@@ -36,11 +39,14 @@ type Command struct {
 	retentionPolicy string
 	shardID         string
 
-	isBackup   bool
-	since      time.Time
-	start      time.Time
-	end        time.Time
-	enterprise bool
+	isBackup bool
+	since    time.Time
+	start    time.Time
+	end      time.Time
+
+	enterprise         bool
+	manifest           backup_util.Manifest
+	enterpriseFileBase string
 }
 
 // NewCommand returns a new instance of Command with default settings.
@@ -124,6 +130,9 @@ func (cmd *Command) parseFlags(args []string) (err error) {
 		return err
 	}
 
+	// for enterprise saving, if needed
+	cmd.enterpriseFileBase = time.Now().UTC().Format(backup_util.EnterpriseFileNamePattern)
+
 	// if startArg and endArg are unspecified, then assume we are doing a full backup of the DB
 	cmd.isBackup = startArg == "" && endArg == ""
 
@@ -199,7 +208,28 @@ func (cmd *Command) backupShard(rp, sid string) error {
 	}
 
 	// TODO: verify shard backup data
-	return cmd.downloadAndVerify(req, shardArchivePath, nil)
+	err := cmd.downloadAndVerify(req, shardArchivePath, nil)
+
+	if err != nil {
+		return err
+	}
+
+	if cmd.enterprise {
+		f, err := os.Open(shardArchivePath)
+		defer f.Close()
+		defer os.Remove(shardArchivePath)
+		tr := tar.NewReader(f)
+		filename := fmt.Sprintf("%s.s%s.tar.gz", cmd.enterpriseFileBase, sid)
+		out, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0600)
+		defer out.Close()
+		zw := gzip.NewWriter(out)
+		defer zw.Close()
+
+		io.Copy(zw, tr)
+
+	}
+	return nil
+
 }
 
 // backupDatabase will request the database information from the server and then backup
@@ -297,16 +327,29 @@ func (cmd *Command) backupMetastore(useDB string) error {
 			return errors.New("invalid metadata received")
 		}
 
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if cmd.enterprise {
+		metaBytes, err := backup_util.GetMetaBytes(metastoreArchivePath)
+		defer os.Remove(metastoreArchivePath)
 		if err != nil {
 			return err
 		}
-
-		if cmd.enterprise {
-			// we need to clean up the metadata blob
+		filename := cmd.enterpriseFileBase + ".meta"
+		if err := ioutil.WriteFile(filepath.Join(cmd.path, filename), metaBytes, 0644); err != nil {
+			fmt.Fprintln(cmd.Stdout, "Error.")
+			return err
 		}
+		cmd.manifest.Meta.FileName = filename
+		cmd.manifest.Meta.Size = int64(len(metaBytes))
+	}
 
-		return nil
-	})
+	return nil
 }
 
 // nextPath returns the next file to write to.
