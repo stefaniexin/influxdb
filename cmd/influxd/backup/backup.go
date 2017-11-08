@@ -15,20 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/tcp"
-)
-
-const (
-	// Suffix is a suffix added to the backup while it's in-process.
-	Suffix = ".pending"
-
-	// Metafile is the base name given to the metastore backups.
-	Metafile = "meta"
-
-	// BackupFilePattern is the beginning of the pattern for a backup
-	// file. They follow the scheme <database>.<retention>.<shardID>.<increment>
-	BackupFilePattern = "%s.%s.%05d"
 )
 
 // Command represents the program execution for "influxd backup".
@@ -47,10 +36,11 @@ type Command struct {
 	retentionPolicy string
 	shardID         string
 
-	isBackup bool
-	since    time.Time
-	start    time.Time
-	end      time.Time
+	isBackup   bool
+	since      time.Time
+	start      time.Time
+	end        time.Time
+	enterprise bool
 }
 
 // NewCommand returns a new instance of Command with default settings.
@@ -124,6 +114,7 @@ func (cmd *Command) parseFlags(args []string) (err error) {
 	fs.StringVar(&sinceArg, "since", "", "")
 	fs.StringVar(&startArg, "start", "", "")
 	fs.StringVar(&endArg, "end", "", "")
+	fs.BoolVar(&cmd.enterprise, "enterprise", false, "")
 
 	fs.SetOutput(cmd.Stderr)
 	fs.Usage = cmd.printUsage
@@ -189,7 +180,7 @@ func (cmd *Command) backupShard(rp, sid string) error {
 		return err
 	}
 
-	shardArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, fmt.Sprintf(BackupFilePattern, cmd.database, rp, id)))
+	shardArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, fmt.Sprintf(backup_util.BackupFilePattern, cmd.database, rp, id)))
 	if err != nil {
 		return err
 	}
@@ -271,7 +262,7 @@ func (cmd *Command) backupResponsePaths(response *snapshotter.Response) error {
 // backupMetastore will backup the whole metastore on the host to the backup path
 // if useDB is non-empty, it will backup metadata only for the named database.
 func (cmd *Command) backupMetastore(useDB string) error {
-	metastoreArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, Metafile))
+	metastoreArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, backup_util.Metafile))
 	if err != nil {
 		return err
 	}
@@ -283,7 +274,7 @@ func (cmd *Command) backupMetastore(useDB string) error {
 		Database: useDB,
 	}
 
-	return cmd.downloadAndVerify(req, metastoreArchivePath, func(file string) error {
+	err = cmd.downloadAndVerify(req, metastoreArchivePath, func(file string) error {
 		f, err := os.Open(file)
 		if err != nil {
 			return err
@@ -306,6 +297,14 @@ func (cmd *Command) backupMetastore(useDB string) error {
 			return errors.New("invalid metadata received")
 		}
 
+		if err != nil {
+			return err
+		}
+
+		if cmd.enterprise {
+			// we need to clean up the metadata blob
+		}
+
 		return nil
 	})
 }
@@ -326,7 +325,7 @@ func (cmd *Command) nextPath(path string) (string, error) {
 // downloadAndVerify will download either the metastore or shard to a temp file and then
 // rename it to a good backup file name after complete
 func (cmd *Command) downloadAndVerify(req *snapshotter.Request, path string, validator func(string) error) error {
-	tmppath := path + Suffix
+	tmppath := path + backup_util.Suffix
 	if err := cmd.download(req, tmppath); err != nil {
 		return err
 	}

@@ -18,6 +18,7 @@ import (
 
 	"encoding/json"
 	"github.com/influxdata/influxdb/cmd/influxd/backup"
+	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/tcp"
@@ -161,7 +162,7 @@ func (cmd *Command) parseFlags(args []string) error {
 // cluster and replaces the root metadata.
 func (cmd *Command) unpackMeta() error {
 	// find the meta file
-	metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup.Metafile+".*"))
+	metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup_util.Metafile+".*"))
 	if err != nil {
 		return err
 	}
@@ -261,7 +262,7 @@ func (cmd *Command) unpackMeta() error {
 // for a live merger of metadata.
 func (cmd *Command) updateMetaLive() error {
 	// find the meta file
-	metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup.Metafile+".*"))
+	metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup_util.Metafile+".*"))
 	if err != nil {
 		return err
 	}
@@ -279,7 +280,7 @@ func (cmd *Command) updateMetaLive() error {
 		Database: cmd.destinationDatabase,
 	}
 
-	metaBytes, err := cmd.getMetaBytes(latest)
+	metaBytes, err := backup_util.GetMetaBytes(latest)
 
 	resp, err := cmd.updateMetaRemote(req, bytes.NewReader(metaBytes), int64(len(metaBytes)))
 	if err != nil {
@@ -312,35 +313,6 @@ func (cmd *Command) updateMetaLive() error {
 	}
 
 	return err
-}
-
-func (cmd *Command) getMetaBytes(fname string) ([]byte, error) {
-	f, err := os.Open(fname)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, f); err != nil {
-		return []byte{}, fmt.Errorf("copy: %s", err)
-	}
-
-	b := buf.Bytes()
-	var i int
-
-	// Make sure the file is actually a meta store backup file
-	magic := binary.BigEndian.Uint64(b[:8])
-	if magic != snapshotter.BackupMagicHeader {
-		return []byte{}, fmt.Errorf("invalid metadata file")
-	}
-	i += 8
-
-	// Size of the meta store bytes
-	length := int(binary.BigEndian.Uint64(b[i : i+8]))
-	i += 8
-	metaBytes := b[i : i+length]
-
-	return metaBytes, nil
 }
 
 // upload takes a request object, attaches a Base64 encoding to the request, and sends it to the snapshotter service.
@@ -397,7 +369,7 @@ func (cmd *Command) unpackShard(shardID string) error {
 	}
 
 	// find the shard backup files
-	pat := filepath.Join(cmd.backupFilesPath, fmt.Sprintf(backup.BackupFilePattern, cmd.destinationDatabase, cmd.retention, id))
+	pat := filepath.Join(cmd.backupFilesPath, fmt.Sprintf(backup_util.BackupFilePattern, cmd.destinationDatabase, cmd.retention, id))
 	return cmd.unpackFiles(pat + ".*")
 }
 
