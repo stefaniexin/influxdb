@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"archive/tar"
 	"compress/gzip"
 	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/snapshotter"
@@ -95,6 +94,12 @@ func (cmd *Command) Run(args ...string) error {
 		}
 
 		cmd.StdoutLogger.Println("No database, retention policy or shard ID given. Full meta store backed up.")
+	}
+
+	if cmd.enterprise {
+		cmd.manifest.Platform = "OSS"
+		filename := cmd.enterpriseFileBase + ".manifest"
+		cmd.manifest.Save(filepath.Join(cmd.path, filename))
 	}
 
 	if err != nil {
@@ -208,7 +213,7 @@ func (cmd *Command) backupShard(rp, sid string) error {
 	}
 
 	// TODO: verify shard backup data
-	err := cmd.downloadAndVerify(req, shardArchivePath, nil)
+	err = cmd.downloadAndVerify(req, shardArchivePath, nil)
 
 	if err != nil {
 		return err
@@ -218,14 +223,30 @@ func (cmd *Command) backupShard(rp, sid string) error {
 		f, err := os.Open(shardArchivePath)
 		defer f.Close()
 		defer os.Remove(shardArchivePath)
-		tr := tar.NewReader(f)
-		filename := fmt.Sprintf("%s.s%s.tar.gz", cmd.enterpriseFileBase, sid)
-		out, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0600)
+
+		filePrefix := cmd.enterpriseFileBase + ".s" + sid
+		filename := filePrefix + ".tar.gz"
+		out, err := os.OpenFile(filepath.Join(cmd.path, filename), os.O_CREATE|os.O_RDWR, 0600)
 		defer out.Close()
 		zw := gzip.NewWriter(out)
+		zw.Name = filePrefix + ".tar"
 		defer zw.Close()
+		cw := backup_util.CountingWriter{Writer: zw}
 
-		io.Copy(zw, tr)
+		io.Copy(cw, f)
+
+		shardid, err := strconv.ParseUint(sid, 10, 64)
+		if err != nil {
+			return err
+		}
+		cmd.manifest.Files = append(cmd.manifest.Files, backup_util.Entry{
+			Database:     cmd.database,
+			Policy:       rp,
+			ShardID:      shardid,
+			FileName:     filename,
+			Size:         cw.Total,
+			LastModified: 0,
+		})
 
 	}
 	return nil
@@ -345,6 +366,7 @@ func (cmd *Command) backupMetastore(useDB string) error {
 			fmt.Fprintln(cmd.Stdout, "Error.")
 			return err
 		}
+
 		cmd.manifest.Meta.FileName = filename
 		cmd.manifest.Meta.Size = int64(len(metaBytes))
 	}

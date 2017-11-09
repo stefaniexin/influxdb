@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"io/ioutil"
-	"path/filepath"
 )
 
 const (
@@ -60,9 +59,10 @@ func GetMetaBytes(fname string) ([]byte, error) {
 // If Limited is false, the manifest contains a full backup, otherwise
 // it is a partial backup.
 type Manifest struct {
-	Meta    MetaEntry `json:"meta"`
-	Limited bool      `json:"limited"`
-	Files   []Entry   `json:"files"`
+	Platform string    `json:"platform"`
+	Meta     MetaEntry `json:"meta"`
+	Limited  bool      `json:"limited"`
+	Files    []Entry   `json:"files"`
 
 	// If limited is true, then one (or all) of the following fields will be set
 
@@ -115,4 +115,15 @@ func (manifest *Manifest) Save(filename string) error {
 	}
 
 	return ioutil.WriteFile(filename, b, 0600)
+}
+
+type CountingWriter struct {
+	io.Writer
+	Total int64 // Total # of bytes transferred
+}
+
+func (w CountingWriter) Write(p []byte) (n int, err error) {
+	n, err = w.Writer.Write(p)
+	w.Total += int64(n)
+	return
 }
