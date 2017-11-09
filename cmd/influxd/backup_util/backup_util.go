@@ -122,7 +122,7 @@ type CountingWriter struct {
 	Total int64 // Total # of bytes transferred
 }
 
-func (w CountingWriter) Write(p []byte) (n int, err error) {
+func (w *CountingWriter) Write(p []byte) (n int, err error) {
 	n, err = w.Writer.Write(p)
 	w.Total += int64(n)
 	return

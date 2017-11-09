@@ -233,7 +233,7 @@ func (cmd *Command) backupShard(rp, sid string) error {
 		defer zw.Close()
 		cw := backup_util.CountingWriter{Writer: zw}
 
-		io.Copy(cw, f)
+		io.Copy(&cw, f)
 
 		shardid, err := strconv.ParseUint(sid, 10, 64)
 		if err != nil {
