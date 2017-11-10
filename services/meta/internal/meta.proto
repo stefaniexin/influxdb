@@ -6,6 +6,7 @@ package meta;
 //
 //========================================================================
 
+
 message Data {
 	required uint64 Term = 1;
 	required uint64 Index = 2;

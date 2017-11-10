@@ -16,12 +16,16 @@ import (
 	"strconv"
 	"strings"
 
+	"compress/gzip"
 	"encoding/json"
+	"github.com/gogo/protobuf/proto"
 	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/tcp"
 )
+
+//go:generate protoc --gogo_out=. data.proto
 
 // Command represents the program execution for "influxd restore".
 type Command struct {
@@ -44,6 +48,8 @@ type Command struct {
 	retention           string
 	shard               string
 	liveUpdate          bool
+	enterprise          bool
+	manifest            backup_util.Manifest
 
 	// TODO: when the new meta stuff is done this should not be exported or be gone
 	MetaConfig *meta.Config
@@ -69,7 +75,24 @@ func (cmd *Command) Run(args ...string) error {
 		return err
 	}
 
-	if cmd.liveUpdate {
+	if cmd.liveUpdate || cmd.enterprise {
+		if cmd.enterprise {
+			fmt.Println(cmd.backupFilesPath)
+			if filepath.Ext(cmd.backupFilesPath) != ".manifest" {
+				return fmt.Errorf("when using -enterprise, must provide path to a manifest file")
+			}
+			f, err := os.Open(cmd.backupFilesPath)
+			if err != nil {
+				return err
+			}
+
+			if err := json.NewDecoder(f).Decode(&cmd.manifest); err != nil {
+				return fmt.Errorf("read manifest: %v", err)
+			}
+			f.Close()
+			cmd.backupFilesPath = filepath.Dir(cmd.backupFilesPath)
+		}
+
 		err := cmd.updateMetaLive()
 		if err != nil {
 			cmd.StderrLogger.Printf("error updating meta: %v", err)
@@ -108,6 +131,7 @@ func (cmd *Command) parseFlags(args []string) error {
 	fs.StringVar(&cmd.retention, "retention", "", "")
 	fs.StringVar(&cmd.shard, "shard", "", "")
 	fs.BoolVar(&cmd.liveUpdate, "online", false, "")
+	fs.BoolVar(&cmd.enterprise, "enterprise", false, "")
 	fs.SetOutput(cmd.Stdout)
 	fs.Usage = cmd.printUsage
 	if err := fs.Parse(args); err != nil {
@@ -260,26 +284,49 @@ func (cmd *Command) unpackMeta() error {
 // updateMetaLive takes a metadata backup and sends it to the influx server
 // for a live merger of metadata.
 func (cmd *Command) updateMetaLive() error {
-	// find the meta file
-	metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup_util.Metafile+".*"))
-	if err != nil {
-		return err
+
+	var metaBytes []byte
+	if cmd.enterprise {
+		fileName := filepath.Join(cmd.backupFilesPath, cmd.manifest.Meta.FileName)
+
+		fileBytes, err := ioutil.ReadFile(fileName)
+		if err != nil {
+			return err
+		}
+		if cmd.manifest.Platform == "OSS" {
+			metaBytes = fileBytes
+		} else if cmd.manifest.Platform == "ENT" {
+			var pb EnterpriseData
+			if err := proto.Unmarshal(fileBytes, &pb); err != nil {
+				return err
+			}
+
+			metaBytes = pb.GetData()
+		} else {
+			return fmt.Errorf("Unrecognized backup platform: %s", cmd.manifest.Platform)
+		}
+
+	} else {
+		// find the meta file
+		metaFiles, err := filepath.Glob(filepath.Join(cmd.backupFilesPath, backup_util.Metafile+".*"))
+		if err != nil {
+			return err
+		}
+
+		if len(metaFiles) == 0 {
+			return fmt.Errorf("no metastore backups in %s", cmd.backupFilesPath)
+		}
+
+		fileName := metaFiles[len(metaFiles)-1]
+		cmd.StdoutLogger.Printf("Using metastore snapshot: %v\n", fileName)
+		metaBytes, err = backup_util.GetMetaBytes(fileName)
 	}
 
-	if len(metaFiles) == 0 {
-		return fmt.Errorf("no metastore backups in %s", cmd.backupFilesPath)
-	}
-
-	latest := metaFiles[len(metaFiles)-1]
-
-	cmd.StdoutLogger.Printf("Using metastore snapshot: %v\n", latest)
 	// Read the metastore backup
 	req := &snapshotter.Request{
 		Type:     snapshotter.RequestMetaStoreUpdate,
 		Database: cmd.destinationDatabase,
 	}
-
-	metaBytes, err := backup_util.GetMetaBytes(latest)
 
 	resp, err := cmd.updateMetaRemote(req, bytes.NewReader(metaBytes), int64(len(metaBytes)))
 	if err != nil {
@@ -374,87 +421,94 @@ func (cmd *Command) unpackShard(shardID string) error {
 
 // unpackFiles will look for backup files matching the pattern and restore them to the data dir
 func (cmd *Command) uploadShardsLive() error {
-
-	// gets DB, RP, shardID from a path string.
-	//a := strings.Split(path, string(filepath.Separator))
-	//if len(a) != 3 {
-	//	return "", "", fmt.Errorf("expected destinationDatabase, retention policy, and shard id in path: %s", path)
-	//}
-
 	// find the destinationDatabase backup files
-	pat := fmt.Sprintf("%s.*", filepath.Join(cmd.backupFilesPath, cmd.sourceDatabase))
+	if cmd.enterprise {
+		for _, file := range cmd.manifest.Files {
+			if cmd.sourceDatabase == "" || cmd.sourceDatabase == file.Database {
+				if cmd.retention == "" || cmd.retention == file.Policy {
+					if cmd.shard == "" || cmd.shard == strconv.FormatUint(file.ShardID, 10) {
+						cmd.StdoutLogger.Printf("Restoring shard %d live from backup %s\n", file.ShardID, file.FileName)
+						f, err := os.Open(filepath.Join(cmd.backupFilesPath, file.FileName))
+						if err != nil {
+							return err
+						}
+						gr, err := gzip.NewReader(f)
+						if err != nil {
+							return err
+						}
+						tr := tar.NewReader(gr)
+						cmd.uploadShardLive(file.ShardID, tr)
+					}
+				}
+			}
+		}
+	} else {
+		pat := fmt.Sprintf("%s.*", filepath.Join(cmd.backupFilesPath, cmd.sourceDatabase))
+		cmd.StdoutLogger.Printf("Restoring live from backup %s\n", pat)
+		backupFiles, err := filepath.Glob(pat)
+		if err != nil {
+			return err
+		}
+		if len(backupFiles) == 0 {
+			return fmt.Errorf("no backup files in %s", cmd.backupFilesPath)
+		}
 
-	cmd.StdoutLogger.Printf("Restoring live from backup %s\n", pat)
+		for _, fn := range backupFiles {
+			parts := strings.Split(fn, ".")
 
-	backupFiles, err := filepath.Glob(pat)
+			if len(parts) != 4 {
+				cmd.StderrLogger.Printf("Skipping mis-named backup file: %s", fn)
+			}
+			shardID, err := strconv.ParseUint(parts[2], 10, 64)
+			if err != nil {
+				return err
+			}
+			f, err := os.Open(fn)
+			if err != nil {
+				return err
+			}
+			tr := tar.NewReader(f)
+			cmd.uploadShardLive(shardID, tr)
+		}
+	}
+
+	return nil
+}
+
+func (cmd *Command) uploadShardLive(shardID uint64, tr *tar.Reader) error {
+	newShardID := cmd.shardIDMap[shardID]
+
+	conn, err := tcp.Dial("tcp", cmd.host, snapshotter.MuxHeader)
+	defer conn.Close()
 	if err != nil {
 		return err
 	}
 
-	if len(backupFiles) == 0 {
-		return fmt.Errorf("no backup files for %s in %s", pat, cmd.backupFilesPath)
-	}
+	conn.Write([]byte{byte(snapshotter.RequestShardUpdate)})
 
-	for _, fn := range backupFiles {
-		cmd.StdoutLogger.Printf("unpacking %s\n", fn)
-		parts := strings.Split(fn, ".")
+	// 0.  write the shard ID to pw
+	shardBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(shardBytes, newShardID)
+	conn.Write(shardBytes)
 
-		if len(parts) != 4 {
-			cmd.StderrLogger.Printf("Skipping mis-named backup file: %s", fn)
-		}
-		shardID, err := strconv.ParseUint(parts[2], 10, 64)
-		if err != nil {
+	tw := tar.NewWriter(conn)
+	defer tw.Close()
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		} else if err != nil {
 			return err
 		}
 
-		newShardID := cmd.shardIDMap[shardID]
+		names := strings.Split(hdr.Name, "/")
+		hdr.Name = filepath.ToSlash(filepath.Join(cmd.destinationDatabase, names[1], strconv.FormatUint(newShardID, 10), names[3]))
 
-		conn, err := tcp.Dial("tcp", cmd.host, snapshotter.MuxHeader)
-		if err != nil {
+		tw.WriteHeader(hdr)
+		if _, err := io.Copy(tw, tr); err != nil {
 			return err
 		}
-
-		conn.Write([]byte{byte(snapshotter.RequestShardUpdate)})
-
-		// 0.  write the shard ID to pw
-		shardBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(shardBytes, newShardID)
-		conn.Write(shardBytes)
-		// 1.  open TAR reader for file
-		f, err := os.Open(fn)
-
-		if err != nil {
-			return err
-		}
-		tr := tar.NewReader(f)
-
-		tw := tar.NewWriter(conn)
-
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				tw.Close()
-				f.Close()
-				conn.Close()
-				return err
-			}
-
-			names := strings.Split(hdr.Name, "/")
-			hdr.Name = filepath.ToSlash(filepath.Join(cmd.destinationDatabase, names[1], strconv.FormatUint(newShardID, 10), names[3]))
-
-			tw.WriteHeader(hdr)
-			if _, err := io.Copy(tw, tr); err != nil {
-				tw.Close()
-				f.Close()
-				conn.Close()
-				return err
-			}
-		}
-		tw.Close()
-		f.Close()
-		conn.Close()
 	}
 
 	return nil
